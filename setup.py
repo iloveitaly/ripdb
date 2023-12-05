@@ -43,6 +43,5 @@ if __name__ == "__main__":
         long_description = LONG_DESCRIPTION,
         url = URL,
         packages = find_packages(),
-        install_requires = ['ipython>=3.0',
-                            'six'],
+        install_requires = ['ipython>=3.0'],
     )

@@ -15,12 +15,12 @@ import traceback
 
 import IPython.core.debugger as pdb
 from IPython.utils import io
-import six
 
 try:
     get_ipython
 except NameError:
     import IPython.terminal.embed as embed
+
     InteractiveShellEmbed = embed.InteractiveShellEmbed
     ipshell = InteractiveShellEmbed()
     def_colors = ipshell.colors
@@ -32,7 +32,6 @@ else:
 
 
 class Rpdb(pdb.Pdb):
-
     def __init__(self, addr="127.0.0.1", port=4444):
         """Initialize the socket and initialize pdb."""
 
@@ -42,15 +41,17 @@ class Rpdb(pdb.Pdb):
         self.port = port
 
         # Open a 'reusable' socket to let the webapp reload on the same port
+        # SO_REUSEADDR is needed to avoid the "Address already in use" error when rebinding to the same port
         self.skt = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.skt.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, True)
         self.skt.bind((addr, port))
         self.skt.listen(1)
 
-        # Writes to stdout are forbidden in mod_wsgi environments
+        # Writes to stdout are forbidden in mod_wsgi environments and other environments that use stdout for communication
+        # (like a jsonlines-based system).
+
         try:
-            sys.stderr.write("pdb is running on %s:%d\n"
-                             % self.skt.getsockname())
+            sys.stderr.write("pdb is running on %s:%d\n" % self.skt.getsockname())
         except IOError:
             pass
 
@@ -59,21 +60,21 @@ class Rpdb(pdb.Pdb):
             sys.excepthook = pdb.BdbQuit_excepthook
 
         (clientsocket, address) = self.skt.accept()
-        if six.PY3:
-            handle = connect_to_pty(clientsocket.makefile('rw', None))
-        else:
-            handle = connect_to_pty(clientsocket.makefile('r+', 0))           
+        handle = connect_to_pty(clientsocket.makefile("rw", None))
+        self.clientsocket = clientsocket
         io.stdout = sys.stdout = sys.stdin = handle
         pdb.Pdb.__init__(self, def_colors)
         OCCUPIED.claim(port, sys.stdout)
 
+    # TODO this shutdown operation does NOT close the socket properly, which does not kill to socat connection
     def shutdown(self):
         """Revert stdin and stdout, close the socket."""
         sys.stdout = self.old_stdout
         sys.stdin = self.old_stdin
-        OCCUPIED.unclaim(self.port)
         sys.excepthook = pdb.BdbQuit_excepthook.excepthook_ori
+        self.clientsocket.close()
         self.skt.close()
+        OCCUPIED.unclaim(self.port)
 
     def do_continue(self, arg):
         """Clean-up and do underlying continue."""
@@ -107,37 +108,32 @@ def copy_worker(file_from, file_to):
         if not c:
             break
         file_to.write(c)
-        if six.PY3:
-            file_to.flush()
+        file_to.flush()
+
 
 def connect_to_pty(sock):
     def _multiprocessing_context():
         try:
-            return multiprocessing.get_context('fork')
+            return multiprocessing.get_context("fork")
         except (AttributeError, ValueError):
             return multiprocessing
 
     ptym_fd, ptys_fd = pty.openpty()
-    if six.PY3:
-        import io
-        _ptym = os.fdopen(ptym_fd, 'r+b', 0)
-        ptym = io.TextIOWrapper(_ptym, write_through=True)
-        _ptys = os.fdopen(ptys_fd, 'r+b', 0)
-        ptys = io.TextIOWrapper(_ptys, write_through=True)
-    else:
-        ptym = os.fdopen(ptym_fd, 'r+', 0)
-        ptys = os.fdopen(ptys_fd, 'r+', 0)
+    import io
+
+    _ptym = os.fdopen(ptym_fd, "r+b", 0)
+    ptym = io.TextIOWrapper(_ptym, write_through=True)
+    _ptys = os.fdopen(ptys_fd, "r+b", 0)
+    ptys = io.TextIOWrapper(_ptys, write_through=True)
 
     # Setup two processes for copying between socket and master pty.
     sock_to_ptym = _multiprocessing_context().Process(
-        target=copy_worker,
-        args=(sock, ptym)
+        target=copy_worker, args=(sock, ptym)
     )
     sock_to_ptym.daemon = True
     sock_to_ptym.start()
     ptym_to_sock = _multiprocessing_context().Process(
-        target=copy_worker,
-        args=(ptym, sock)
+        target=copy_worker, args=(ptym, sock)
     )
     ptym_to_sock.daemon = True
     ptym_to_sock.start()
@@ -145,20 +141,22 @@ def connect_to_pty(sock):
 
 
 def set_trace(addr="127.0.0.1", port=4444):
-    """Wrapper function to keep the same import x; x.set_trace() interface.
+    """
+    Wrapper function to keep the same import x; x.set_trace() interface.
 
     We catch all the possible exceptions from pdb and cleanup.
-
     """
+
     try:
         debugger = Rpdb(addr=addr, port=port)
     except socket.error:
         if OCCUPIED.is_claimed(port, sys.stdout):
             # rpdb is already on this port - good enough, let it go on:
-            sys.stdout.write("(Recurrent rpdb invocation ignored)\n")
+            sys.stderr.write("[ripdb] (Recurrent rpdb invocation ignored)\n")
             return
         else:
             # Port occupied by something else.
+            sys.stderr.write("[ripdb] Targeted port is occupied by someone else\n")
             raise
     try:
         debugger.set_trace(sys._getframe().f_back)
@@ -187,7 +185,7 @@ class OccupiedPorts(object):
 
     def is_claimed(self, port, handle):
         self.lock.acquire(True)
-        got = (self.claims.get(port) == id(handle))
+        got = self.claims.get(port) == id(handle)
         self.lock.release()
         return got
 
@@ -195,6 +193,7 @@ class OccupiedPorts(object):
         self.lock.acquire(True)
         del self.claims[port]
         self.lock.release()
+
 
 # {port: sys.stdout} pairs to track recursive rpdb invocation on same port.
 # This scheme doesn't interfere with recursive invocations on separate ports -
